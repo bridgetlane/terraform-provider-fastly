@@ -244,6 +244,74 @@ func TestAccFastlyServiceV1_updateBackend(t *testing.T) {
 	})
 }
 
+// TestAccFastlyServiceV1_activateNewVersionExternally tests whether things break when a new version is cloned and
+// activated outside of Terraform. There has been a bug where the version used for reading the state, and the version
+// that gets cloned in order to make updates, are different when a new version is activated externally. In this case, a
+// 409 conflict error is produced by this test because it reads the new version when making a plan, plans to re-add in
+// the deleted backend, but clones the original version which still had the backend and fails with a conflict.
+func TestAccFastlyServiceV1_activateNewVersionExternally(t *testing.T) {
+	var service gofastly.ServiceDetail
+	name := fmt.Sprintf("tf-test-%s", acctest.RandString(10))
+	domain := fmt.Sprintf("fastly-test.tf-%s.com", acctest.RandString(10))
+	backendName := fmt.Sprintf("%s.aws.amazon.com", acctest.RandString(3))
+	backendName2 := fmt.Sprintf("%s.aws.amazon.com", acctest.RandString(3))
+
+	activateNewVersion := func(*terraform.State) error {
+		conn := testAccProvider.Meta().(*FastlyClient).conn
+		version, err := conn.CloneVersion(&gofastly.CloneVersionInput{
+			ServiceID:      service.ID,
+			ServiceVersion: service.ActiveVersion.Number,
+		})
+		if err != nil {
+			return err
+		}
+
+		err = conn.DeleteBackend(&gofastly.DeleteBackendInput{
+			ServiceID:      service.ID,
+			ServiceVersion: version.Number,
+			Name:           "tf-test-backend",
+		})
+		if err != nil {
+			return err
+		}
+
+		_, err = conn.ActivateVersion(&gofastly.ActivateVersionInput{
+			ServiceID:      service.ID,
+			ServiceVersion: version.Number,
+		})
+		return err
+	}
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:          func() { testAccPreCheck(t) },
+		ProviderFactories: testAccProviders,
+		CheckDestroy:      testAccCheckServiceV1Destroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccServiceV1Config_backend_update(name, domain, backendName, backendName2, 3400),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServiceV1Exists("fastly_service_v1.foo", &service),
+					testAccCheckFastlyServiceV1Attributes_backends(&service, name, []string{backendName, backendName2}),
+					activateNewVersion,
+				),
+				ExpectNonEmptyPlan: true,
+			},
+
+			{
+				Config: testAccServiceV1Config_backend_update(name, domain, backendName, backendName2, 3400),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServiceV1Exists("fastly_service_v1.foo", &service),
+					testAccCheckFastlyServiceV1Attributes_backends(&service, name, []string{backendName, backendName2}),
+					resource.TestCheckResourceAttr(
+						"fastly_service_v1.foo", "active_version", "3"),
+					resource.TestCheckResourceAttr(
+						"fastly_service_v1.foo", "backend.#", "2"),
+				),
+			},
+		},
+	})
+}
+
 func TestAccFastlyServiceV1_updateInvalidBackend(t *testing.T) {
 	var service gofastly.ServiceDetail
 	name := fmt.Sprintf("tf-test-%s", acctest.RandString(10))
@@ -551,6 +619,47 @@ func TestAccFastlyServiceV1_createDefaultTTL(t *testing.T) {
 	})
 }
 
+// TestAccFastlyServiceV1_brokenSnippet tests that a service can still be updated after it has failed during an apply.
+// This avoids a bug when activate=true, where setting an invalid snippet causes the resourceServiceUpdate function to
+// return early before activating the version. This broke the assumption that cloned_version always tracks the active
+// version when activate=true, and means that the version we read from, and the one we clone from in order to make changes,
+// are different, meaning the plan is applied to a different version and 409 conflict errors can occur.
+func TestAccFastlyServiceV1_brokenSnippet(t *testing.T) {
+	var service gofastly.ServiceDetail
+	name := fmt.Sprintf("tf-test-%s", acctest.RandString(10))
+	domain := fmt.Sprintf("fastly-test.tf-%s.test", acctest.RandString(10))
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:          func() { testAccPreCheck(t) },
+		ProviderFactories: testAccProviders,
+		CheckDestroy:      testAccCheckServiceV1Destroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccServiceV1Config_brokenSnippet(name, domain, "backend1", `if (req.url !~ "^/anything") {
+                       set req.url = "/anything" req.url;
+                     }`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServiceV1Exists("fastly_service_v1.foo", &service),
+				),
+			},
+			{
+				Config: testAccServiceV1Config_brokenSnippet(name, domain, "backend2", `if (req.url !~ "^/anything") {
+                       set req.url = "/anything" req.url
+                     }`),
+				ExpectError: regexp.MustCompile(`Invalid configuration for Fastly Service`),
+			},
+			{
+				Config: testAccServiceV1Config_brokenSnippet(name, domain, "backend2", `if (req.url !~ "^/anything") {
+                       set req.url = "/anything" req.url;
+                     }`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServiceV1Exists("fastly_service_v1.foo", &service),
+				),
+			},
+		},
+	})
+}
+
 func TestAccFastlyServiceV1_createZeroDefaultTTL(t *testing.T) {
 	var service gofastly.ServiceDetail
 	name := fmt.Sprintf("tf-test-%s", acctest.RandString(10))
@@ -773,6 +882,33 @@ resource "fastly_service_v1" "foo" {
 
   force_destroy = true
 }`, name, ttl, domain, backend, backend2)
+}
+
+func testAccServiceV1Config_brokenSnippet(name, domain, backendName, snippet string) string {
+	return fmt.Sprintf(`
+resource "fastly_service_v1" "foo" {
+    name           = "%s"
+    activate       = true
+    force_destroy = true
+
+    backend {
+        address = "httpbin.org"
+        name = "%s"
+    }
+
+    domain {
+        name = "%s"
+    }
+
+    snippet {
+        content  = <<-EOT
+            %s
+        EOT
+        name     = "url rewrite"
+        priority = 100
+        type     = "recv"
+    }
+}`, name, backendName, domain, snippet)
 }
 
 func testSweepServices(region string) error {

@@ -3,9 +3,10 @@ package fastly
 import (
 	"context"
 	"errors"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"log"
 	"time"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 
 	gofastly "github.com/fastly/go-fastly/v3/fastly"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -360,7 +361,6 @@ func resourceServiceUpdate(ctx context.Context, d *schema.ResourceData, meta int
 
 			// The new version number is named "Number", but it's actually a string.
 			latestVersion = newVersion.Number
-			d.Set("cloned_version", latestVersion)
 
 			// New versions are not immediately found in the API, or are not
 			// immediately mutable, so we need to sleep a few and let Fastly ready
@@ -409,6 +409,10 @@ func resourceServiceUpdate(ctx context.Context, d *schema.ResourceData, meta int
 			return diag.Errorf("[ERR] Invalid configuration for Fastly Service (%s): %s", d.Id(), msg)
 		}
 
+		err = d.Set("cloned_version", latestVersion)
+		if err != nil {
+			return diag.FromErr(err)
+		}
 	}
 
 	shouldActivate := d.Get("activate").(bool)
@@ -452,7 +456,7 @@ func resourceServiceRead(ctx context.Context, d *schema.ResourceData, meta inter
 		if e, ok := err.(*gofastly.HTTPError); ok && e.IsNotFound() {
 			log.Printf("[WARN] %s for ID (%s)", fastlyNoServiceFoundErr, d.Id())
 			d.SetId("")
-			return nil
+			return diag.FromErr(err)
 		}
 		return diag.FromErr(err)
 	}
@@ -509,8 +513,14 @@ func resourceServiceRead(ctx context.Context, d *schema.ResourceData, meta inter
 
 	// If activate is false, then read the state from cloned_version instead of
 	// the active version.
+	// Otherwise, cloned_version should track the active version
 	if d.Get("activate") == false {
 		s.ActiveVersion.Number = d.Get("cloned_version").(int)
+	} else {
+		err := d.Set("cloned_version", s.ActiveVersion.Number)
+		if err != nil {
+			return diag.FromErr(err)
+		}
 	}
 
 	// If CreateService succeeds, but initial updates to the Service fail, we'll
